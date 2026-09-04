@@ -10,10 +10,7 @@ import { createCopilotHonoHandler } from "@copilotkit/runtime/v2/hono";
 import type { Observable } from "rxjs";
 import { defer, finalize, from, fromEvent, switchMap, takeUntil } from "rxjs";
 import { z } from "zod";
-import {
-  COMPUTER_GUIDANCE,
-  PROVENANCE_GUIDANCE,
-} from "../../shared/bot-prompt";
+import { PROVENANCE_GUIDANCE } from "../../shared/bot-prompt";
 import { sanitizeSeededHistory } from "./agents/history-sanitize";
 import type { AgentActor } from "./agents/profile-types";
 import type { AuditInitiator } from "./audit";
@@ -1946,12 +1943,12 @@ export function mountCopilotRuntime(
   ) => LoadToolsForBot,
   signRunForActor?: (actorId: string, initiator?: AuditInitiator) => SignRun,
   basePath = "/api/copilotkit",
-  loadVendors?: () => Promise<readonly string[]>,
-  selectionForActor?: (actorId: string) => ToolSelection,
+  _loadVendors?: () => Promise<readonly string[]>,
+  _selectionForActor?: (actorId: string) => ToolSelection,
   /** The fetch remote agents are dialled with. See {@link buildAgents}. */
-  agentFetch?: AgentFetch,
+  _agentFetch?: AgentFetch,
   /** How a run gets its tool for handing work on. Absent means no Bot is offered one. */
-  handoffForActor?: (actorId: string) => HandoffForRun,
+  _handoffForActor?: (actorId: string) => HandoffForRun,
   /**
    * Told when a run starts and ends on a thread, so a channel can show it is working.
    *

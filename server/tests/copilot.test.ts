@@ -1,6 +1,5 @@
 import { describe, expect, spyOn, test } from "bun:test";
-import { dirname, join } from "node:path";
-import { fileURLToPath } from "node:url";
+
 import type { AbstractAgent, RunAgentInput } from "@ag-ui/client";
 import { HttpAgent } from "@ag-ui/client";
 import { LLMock } from "@copilotkit/aimock";
