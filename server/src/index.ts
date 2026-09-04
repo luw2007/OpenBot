@@ -84,6 +84,12 @@ import {
 import { createDatabase } from "./db/client";
 import { intelligenceChannelMappings } from "./db/schema";
 import { createOnboardingStore } from "./people/onboarding";
+import { createExternalLinkStore } from "./external/link-store";
+import { createExternalLinkRoutes } from "./external/routes";
+import { createExternalThreadStore } from "./external/thread-store";
+import { createOpenBotFeishuChannel } from "./feishu/channel";
+import { createFeishuIdentityResolver } from "./feishu/identity";
+import { createFeishuTransport } from "./feishu/transport";
 import { createPeopleStore } from "./people/store";
 import { useRoutineTools } from "./plugins/builtin-routines";
 import { redirectUriFor } from "./plugins/oauth";
@@ -936,8 +942,65 @@ const copilotRuntime = mountCopilotRuntime(
     });
     return passing ? [passing, asking] : [asking];
   },
-  // A run started or ended on a thread; light the channel it belongs to. Fire-and-forget, keyed by
-  // thread, and a scratch thread maps to no channel and signals nowhere.
+});
+const slackIngress = new SlackIngressRegistry();
+const openbotSlackChannel = createOpenBotSlackChannel({
+  appUrl: config.appUrl,
+  configuredTenantId: config.slackTenantId,
+  identityLinker: new SlackIdentityLinker({
+    store: externalLinkStore,
+    encryptionKey: config.keyEncryptionKey,
+    appUrl: config.appUrl,
+  }),
+  ingressRegistry: slackIngress,
+  agentDeps: {
+    routing: slackRouting,
+    store: externalThreadStore,
+    resolver: actorAgentResolver,
+  },
+  computerGateway,
+  // Secrets, sign-in control and 2FA are asked for on OpenBot's own surface, never in Slack. Absent
+  // an app URL there is nowhere to send somebody, so the channel offers no assistance at all.
+  assistance: config.appUrl
+    ? { appUrl: config.appUrl, encryptionKey: config.keyEncryptionKey }
+    : undefined,
+});
+
+/**
+ * The runtime, and the two things beside it a hop needs.
+ *
+ * `agentFor` builds the addressed Bot exactly the way a person's run builds it, and `history` reads
+ * the conversation through the same client. Taken from here rather than assembled again, because a
+ * Bot built by parallel wiring drifts the first time one of these arguments changes, and the drift is
+ * invisible: it runs, and quietly holds different tools or a different role from the one the person
+ * is talking to.
+ */
+const feishuChannel = config.feishu
+  ? createOpenBotFeishuChannel({
+      transport: createFeishuTransport(config.feishu),
+      agentDeps: {
+        routing: slackRouting,
+        store: externalThreadStore,
+        resolver: actorAgentResolver,
+      },
+      resolveUser: createFeishuIdentityResolver({
+        store: externalLinkStore,
+        encryptionKey: config.keyEncryptionKey,
+        appUrl: config.appUrl,
+      }),
+    })
+  : undefined;
+
+const copilotRuntime = mountCopilotRuntime(
+  config,
+  actorAgentResolver,
+  identifyUser,
+  identifyActor,
+  "/api/copilotkit",
+  loadVendors,
+  selectionForActor,
+  agentFetch,
+  handoffForActor,
   (input) => {
     void channelStore.signalBusy(input.threadId, input.busy).catch(() => {});
   },
@@ -951,6 +1014,30 @@ const copilotRuntime = mountCopilotRuntime(
   markAttachmentsSentForActor,
 );
 
+await feishuChannel?.start();
+
+/*
+ * The guard the account-link confirmation runs behind: a person's own session, never Slack's word.
+ *
+ * `loadConfig` permits no-provider operation only in explicit single-user mode. The invariant is
+ * checked again here so this route can never be handed an undefined auth service.
+ */
+const requireExternalUser = config.singleUser
+  ? createDevRequireUser()
+  : (() => {
+      if (!auth) {
+        throw new Error("Slack account linking requires authentication.");
+      }
+      return createRequireUser(auth, roleRepository);
+    })();
+const externalLinkRoutes = createExternalLinkRoutes({
+  store: externalLinkStore,
+  encryptionKey: config.keyEncryptionKey,
+  requireUser: requireExternalUser,
+  auditStore: bootAuditStore,
+  agentProfileStore,
+  threadStore: externalThreadStore,
+});
 /**
  * Delivering hops, on every replica.
  *
@@ -1404,6 +1491,32 @@ serve<SocketData>({
       ws.data.inward?.close();
     },
   },
+} satisfies Bun.Serve.Options<SocketData>;
+const startWeb = () => serve<SocketData>(serverOptions);
+
+/**
+ * The listener, started and stopped by the managed Slack host rather than at import.
+ *
+ * Managed Slack delivery arrives over an outbound socket this process opens, so the channel host
+ * has to be running before a Slack turn can reach a coworker, and the HTTP listener has to be up
+ * before the host so that setup and health stay reachable while attachment settles. Ownership of
+ * both is handed to one place so a signal stops them in that order, rather than a signal handler
+ * here racing an attachment that is still in progress.
+ */
+const managedHost = startManagedChannelHost({
+  startWeb,
+  stopWeb: (server) => server.stop(true),
+  channels: copilotRuntime.channels,
+  signals: process,
+  // Each listener holds a connection of its own for the life of the process. Released on the way
+  // out, so a watch-mode restart does not leave two behind on every reload.
+  stopOthers: [
+    () => feishuChannel?.stop() ?? Promise.resolve(),
+    () => channelActivityListener.stop(),
+    () => policyListener.stop(),
+    () => retentionSweeps.stop(),
+  ],
+  exit: (code) => process.exit(code),
 });
 
 if (config.singleUser) {

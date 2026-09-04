@@ -71,6 +71,59 @@ describe("deployment configuration", () => {
     expect(config.tenantPackageDirectory).toBe("../examples/fintech");
   });
 
+  test("loads a canonical managed Slack tenant fallback", () => {
+    expect(
+      loadConfig({
+        ...baseEnvironment,
+        OPENBOT_SLACK_TENANT_ID: " T05QFA4BW9X ",
+      }).slackTenantId,
+    ).toBe("T05QFA4BW9X");
+  });
+
+  test("loads Feishu long-connection credentials only as a complete set", () => {
+    expect(
+      loadConfig({
+        ...baseEnvironment,
+        FEISHU_APP_ID: " cli_a1 ",
+        FEISHU_APP_SECRET: " secret ",
+        FEISHU_TENANT_KEY: " tenant-key ",
+      }).feishu,
+    ).toEqual({
+      appId: "cli_a1",
+      appSecret: "secret",
+      tenantKey: "tenant-key",
+    });
+
+    expect(() =>
+      loadConfig({ ...baseEnvironment, FEISHU_APP_ID: "cli_a1" }),
+    ).toThrow(
+      "FEISHU_APP_ID, FEISHU_APP_SECRET, and FEISHU_TENANT_KEY must be configured together",
+    );
+  });
+
+  test.each(["unknown", " UNKNOWN "])(
+    "rejects the non-canonical managed Slack tenant %j",
+    (tenantId) => {
+      expect(() =>
+        loadConfig({
+          ...baseEnvironment,
+          OPENBOT_SLACK_TENANT_ID: tenantId,
+        }),
+      ).toThrow(
+        "OPENBOT_SLACK_TENANT_ID must be a canonical Slack workspace ID, not unknown",
+      );
+    },
+  );
+
+  test("leaves managed Slack tenant fallback disabled when unset or blank", () => {
+    expect(loadConfig(baseEnvironment).slackTenantId).toBeUndefined();
+    expect(
+      loadConfig({
+        ...baseEnvironment,
+        OPENBOT_SLACK_TENANT_ID: "   ",
+      }).slackTenantId,
+    ).toBeUndefined();
+  });
   test("allows deployment without an authentication provider, when asked to", () => {
     const config = loadConfig({
       DATABASE_URL: baseEnvironment.DATABASE_URL,
