@@ -942,6 +942,15 @@ const copilotRuntime = mountCopilotRuntime(
     });
     return passing ? [passing, asking] : [asking];
   },
+  // A run started or ended on a thread; light the channel it belongs to. Fire-and-forget, keyed by
+  // thread, and a scratch thread maps to no channel and signals nowhere.
+  (input) => {
+    void channelStore.signalBusy(input.threadId, input.busy).catch(() => {});
+  },
+  loadInstructionsForActor,
+  loadAttachmentForActor,
+  markAttachmentsSentForActor,
+);
 
 /**
  * One place a coworker is built for one person, for every surface that runs one.
@@ -1495,6 +1504,8 @@ const app = createApp(
     return { text, isError: text.startsWith(REFUSAL_MARKER) };
   },
 );
+
+app.route("/api/external", externalLinkRoutes);
 
 /**
  * The live screen, proxied.
