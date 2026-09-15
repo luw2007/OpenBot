@@ -1,7 +1,6 @@
 import { and, desc, eq, gt, inArray, lt, or } from "drizzle-orm";
 import type { Database } from "./db/client";
 import { auditEvents } from "./db/schema";
-import { parsePageLimit } from "./paging";
 
 const sensitiveKeys = new Set([
   "access_token",
@@ -195,14 +194,11 @@ export const auditEventTypes = [
   // Permitted by policy, attempted, and did not succeed. Its own type because "allowed" reads as
   // "happened", and a trail that cannot tell those apart misleads exactly when it matters most.
   "computer.action_failed",
-  // Permitted, attempted, and stopped mid-action by a person pressing Stop. Kept apart from
-  // `action_failed` because a stop is not an outage: a count of failures that folds in every Stop
-  // reports a broken computer where somebody simply changed their mind.
-  "computer.action_stopped",
   // A person taking the wheel and giving it back. Recorded as a period rather than as keystrokes: the
   // useful fact for an investigator is that a human drove this browser between these two times, and
   // logging every click a person made would bury it while telling nobody anything.
   "computer.help_requested",
+  "computer.assistance_cancelled",
   "computer.control_taken",
   "computer.control_released",
   // A credential a person entered by hand. The row records that it happened, what it was called and
@@ -325,6 +321,7 @@ export const auditEventTypes = [
    */
   "identity_provider.registered",
   "identity_provider.removed",
+  "external_identity.linked",
   /*
    * What a Bot is and what it may reach.
    *
@@ -397,40 +394,11 @@ export const auditEventTypes = [
 
 export type AuditEventType = (typeof auditEventTypes)[number];
 
-/** What caused a row, where `actorUserId` is only whose authority it borrowed. */
-export type AuditInitiator =
-  | { kind: "person" }
-  | { kind: "deployment" }
-  | { kind: "routine"; id: string }
-  | { kind: "handoff"; id: string };
-
-export const PERSON_INITIATOR: AuditInitiator = { kind: "person" };
-
-/** The deployment acting as itself: at start-up, or refusing a caller it could not identify. */
-export const DEPLOYMENT_INITIATOR: AuditInitiator = { kind: "deployment" };
-
-export const auditInitiatorKinds = [
-  "person",
-  "deployment",
-  "routine",
-  "handoff",
-] as const;
-
-export type AuditInitiatorKind = (typeof auditInitiatorKinds)[number];
-
-export function isAuditInitiatorKind(
-  value: string,
-): value is AuditInitiatorKind {
-  return (auditInitiatorKinds as readonly string[]).includes(value);
-}
-
 export type AuditEventInput = {
   eventType: AuditEventType;
   targetType: string;
   targetId?: string;
   actorUserId?: string;
-  /** Omitted means a person did it. */
-  initiator?: AuditInitiator;
   payload: Record<string, unknown>;
 };
 
@@ -438,12 +406,18 @@ export type AuditStore = {
   insert: (event: AuditEventInput) => Promise<void>;
 };
 
+export type AuditTransaction = Parameters<
+  Parameters<Database["transaction"]>[0]
+>[0];
+
+/** An audit writer rebound to a caller's transaction, so the event commits with its subject. */
+export type TransactionalAuditStore = AuditStore & {
+  inTransaction: (transaction: AuditTransaction) => AuditStore;
+};
+
 export type AuditEvent = {
   id: string;
   actorUserId: string | null;
-  /** Read back as written, not narrowed to the union. */
-  initiatorKind: string;
-  initiatorId: string | null;
   eventType: string;
   targetType: string;
   targetId: string | null;
@@ -463,8 +437,6 @@ export type AuditEventQuery = {
    */
   eventType?: string;
   actorUserId?: string;
-  /** One kind, or several separated by commas, the way `eventType` takes several. */
-  initiatorKind?: string;
   targetType?: string;
   targetId?: string;
   from?: string;
@@ -521,36 +493,21 @@ export async function recordAuditEvent(
   });
 }
 
-function initiatorColumns(initiator: AuditInitiator | undefined) {
-  if (!initiator)
-    return { initiatorKind: "person" as const, initiatorId: null };
-  if (initiator.kind === "person" || initiator.kind === "deployment") {
-    return { initiatorKind: initiator.kind, initiatorId: null };
-  }
-  return { initiatorKind: initiator.kind, initiatorId: initiator.id };
-}
-
-export function createAuditStore(database: Database): AuditStore {
+export function createAuditStore(database: Database): TransactionalAuditStore {
   return {
-    insert: async ({ initiator, ...event }) => {
-      await database.insert(auditEvents).values({
-        ...event,
-        ...initiatorColumns(initiator),
-        payload: redactAuditPayload(event.payload) as Record<string, unknown>,
-      });
+    insert: async (event) => {
+      await database.insert(auditEvents).values(event);
     },
+    inTransaction: (transaction) => ({
+      insert: async (event) => {
+        await transaction.insert(auditEvents).values(event);
+      },
+    }),
   };
 }
 
 function encodeCursor(cursor: AuditCursor) {
   return Buffer.from(JSON.stringify(cursor)).toString("base64url");
-}
-
-export class AuditQueryError extends Error {
-  constructor(message: string) {
-    super(message);
-    this.name = "AuditQueryError";
-  }
 }
 
 function decodeCursor(cursor: string): AuditCursor {
@@ -560,12 +517,11 @@ function decodeCursor(cursor: string): AuditCursor {
     ) as AuditCursor;
 
     if (!parsed.id || Number.isNaN(Date.parse(parsed.createdAt))) {
-      throw new AuditQueryError("cursor must be a valid audit page cursor");
+      throw new Error("invalid cursor");
     }
     return parsed;
-  } catch (error) {
-    if (error instanceof AuditQueryError) throw error;
-    throw new AuditQueryError("cursor must be a valid audit page cursor");
+  } catch {
+    throw new Error("cursor must be a valid audit page cursor");
   }
 }
 
@@ -576,10 +532,6 @@ export function createAuditReader(database: Database): AuditReader {
         .split(",")
         .map((type) => type.trim())
         .filter(Boolean);
-      const requestedInitiators = (query.initiatorKind ?? "")
-        .split(",")
-        .map((kind) => kind.trim())
-        .filter((kind) => isAuditInitiatorKind(kind));
       const conditions = [
         requestedTypes.length === 1
           ? eq(auditEvents.eventType, requestedTypes[0] as string)
@@ -589,11 +541,6 @@ export function createAuditReader(database: Database): AuditReader {
         query.actorUserId
           ? eq(auditEvents.actorUserId, query.actorUserId)
           : undefined,
-        requestedInitiators.length === 1
-          ? eq(auditEvents.initiatorKind, requestedInitiators[0] as string)
-          : requestedInitiators.length > 1
-            ? inArray(auditEvents.initiatorKind, requestedInitiators)
-            : undefined,
         query.targetType
           ? eq(auditEvents.targetType, query.targetType)
           : undefined,
@@ -646,48 +593,23 @@ export function createAuditReader(database: Database): AuditReader {
 }
 
 export function auditQueryFromUrl(url: URL): AuditEventQuery {
-  /*
-   * Parsed strictly, like every other paged list. This used to trim and require `/^\d+$/`
-   * but fall back to 50 on anything else, so `?limit=abc`, `?limit=12abc`, `?limit=3.9`
-   * and `?limit=` all silently returned the default page while `?from=garbage` on the same
-   * endpoint answered 400. A typo in the page size is a caller error and names the parameter.
-   */
-  const parsedLimit = parsePageLimit(url.searchParams.get("limit"), 100);
-  if (!parsedLimit.ok) {
-    throw new AuditQueryError(parsedLimit.error);
-  }
-  const limit = parsedLimit.limit ?? 50;
+  const requestedLimit = Number.parseInt(
+    url.searchParams.get("limit") ?? "50",
+    10,
+  );
+  const limit = Number.isFinite(requestedLimit)
+    ? Math.min(Math.max(requestedLimit, 1), 100)
+    : 50;
   const optional = (name: string) => url.searchParams.get(name) ?? undefined;
 
-  const from = optional("from");
-  if (from !== undefined && Number.isNaN(Date.parse(from))) {
-    throw new AuditQueryError('Query parameter "from" must be a valid date.');
-  }
-  const to = optional("to");
-  if (to !== undefined && Number.isNaN(Date.parse(to))) {
-    throw new AuditQueryError('Query parameter "to" must be a valid date.');
-  }
-
-  /*
-   * Fail fast on a stale or hand-edited bookmark. Without this the raw string travels into
-   * `createAuditReader.list`, where `decodeCursor` threw a generic `Error` that escaped the
-   * route's `AuditQueryError` catch as a 500. A corrupt cursor is a caller error, not a server
-   * failure, and answers 400 like a bad `from`/`to` already does.
-   */
-  const cursor = optional("cursor");
-  if (cursor !== undefined) {
-    decodeCursor(cursor);
-  }
-
   return {
-    cursor,
+    cursor: optional("cursor"),
     limit,
     eventType: optional("eventType"),
     actorUserId: optional("actorUserId"),
-    initiatorKind: optional("initiatorKind"),
     targetType: optional("targetType"),
     targetId: optional("targetId"),
-    from,
-    to,
+    from: optional("from"),
+    to: optional("to"),
   };
 }
