@@ -7,6 +7,7 @@ import { serve } from "bun";
 import { eq } from "drizzle-orm";
 import { COMPUTER_GUIDANCE } from "../../shared/bot-prompt";
 import { workOwner } from "../../shared/work-owner";
+import { createActorAgentResolver } from "./agents/agent-resolver";
 import { mintRunAssertion, readRunAssertion } from "./agents/callback-token";
 import { createAgentFetch } from "./agents/endpoint";
 import { askTheirOwnPerson, escalationTool } from "./agents/escalation";
@@ -29,8 +30,12 @@ import {
 } from "./audit";
 import { startRetentionSweeps } from "./audit-retention";
 import { createAuth } from "./auth";
-import { DEV_ACTOR, initializeDevActorUser } from "./auth/dev-actor";
-import { createRoleRepository } from "./auth/guards";
+import {
+  createDevRequireUser,
+  DEV_ACTOR,
+  initializeDevActorUser,
+} from "./auth/dev-actor";
+import { createRequireUser, createRoleRepository } from "./auth/guards";
 import { createIdentityProviderStore } from "./auth/identity-provider-store";
 import { createHostAccessBroker } from "./host-access/broker";
 import { hostAccessTools } from "./host-access/tools";
@@ -73,6 +78,7 @@ import {
   type IdentifyUser,
   mountCopilotRuntime,
   resolveRuntimeAgents,
+  type HandoffForRun,
   runtimeModelForEnvironment,
   type ToolSelection,
 } from "./copilot";
@@ -84,12 +90,19 @@ import {
 import { createDatabase } from "./db/client";
 import { intelligenceChannelMappings } from "./db/schema";
 import { createOnboardingStore } from "./people/onboarding";
+import { createExternalLinkStore } from "./external/link-store";
+import { createExternalLinkRoutes } from "./external/routes";
+import { createExternalThreadStore } from "./external/thread-store";
+import { createOpenBotFeishuChannel } from "./feishu/channel";
+import { createFeishuIdentityResolver } from "./feishu/identity";
+import { createFeishuTransport } from "./feishu/transport";
 import { createPeopleStore } from "./people/store";
 import { useRoutineTools } from "./plugins/builtin-routines";
 import { redirectUriFor } from "./plugins/oauth";
 import { createPluginStore } from "./plugins/store";
 import { grantedSkills, grantedTools, REFUSAL_MARKER } from "./plugins/tools";
 import { createTurnRunner } from "./routines/run-turn";
+import { createCoworkerRoutingService } from "./routing/service";
 import { createRoutineRunner } from "./routines/runner";
 import { createRoutineStore } from "./routines/store";
 import { createIntentRouter } from "./routing/classify";
@@ -288,6 +301,8 @@ const policyListener = await startPolicyListener(
  * unavailable, and the row is a note for a reader rather than something the server depends on.
  */
 const bootAuditStore = createAuditStore(database);
+const externalLinkStore = createExternalLinkStore(database);
+const externalThreadStore = createExternalThreadStore(database);
 // One store: the gateway writes through it, a route reads it, and the sweep below takes the old ones out.
 const pageFrameStore = createPageFrameStore(database);
 // Housekeeping on a schedule: audit rows when asked for, screenshots always, one timer. See audit-retention.ts.
@@ -711,6 +726,42 @@ const agentFetch = createAgentFetch({
   },
 });
 
+const handoffForActor =
+  (actorId: string): HandoffForRun =>
+  async (botId, input) => {
+    const from = readRunAssertion(
+      (input.forwardedProps as { openbotRun?: unknown } | undefined)?.openbotRun,
+      config.keyEncryptionKey,
+    );
+    const run = {
+      botId,
+      actorId,
+      runId: input.runId,
+      threadId: input.threadId,
+      depth: from?.depth ?? 0,
+      initiator: from?.initiator ?? PERSON_INITIATOR,
+    };
+    const couldHandOn =
+      config.handoff.maxDepth > 0 &&
+      config.handoff.maxPerRun > 0 &&
+      run.depth < config.handoff.maxDepth;
+    const passing = couldHandOn
+      ? handoffTool({
+          desk: handoffDesk,
+          from: run,
+          hasSomebodyToAsk: (await pluginStore.botsReachableFrom(botId)).length > 0,
+          maxDepth: config.handoff.maxDepth,
+          maxPerRun: config.handoff.maxPerRun,
+        })
+      : null;
+    const asking = escalationTool({
+      from: run,
+      route: askTheirOwnPerson,
+      auditStore: bootAuditStore,
+    });
+    return passing ? [passing, asking] : [asking];
+  };
+
 /**
  * Who a routine acts as, resolved the way {@link resolveRequestActor} resolves it.
  *
@@ -867,75 +918,7 @@ const copilotRuntime = mountCopilotRuntime(
    * answer belongs, and both of those are the deployment's own statement about the run rather than
    * anything the model can edit.
    */
-  (actorId) => async (botId, input) => {
-    const from = readRunAssertion(
-      (input.forwardedProps as { openbotRun?: unknown } | undefined)
-        ?.openbotRun,
-      config.keyEncryptionKey,
-    );
-    const run = {
-      botId,
-      actorId,
-      runId: input.runId,
-      threadId: input.threadId,
-      depth: from?.depth ?? 0,
-      // Read from the assertion for the reason `depth` is: the run is rebuilt from parts here, and
-      // a field left out of this object is a field the desk and the escalation never see.
-      initiator: from?.initiator ?? PERSON_INITIATOR,
-    };
-    /*
-     * The caps are checked BEFORE the grants query, not inside the tool that would discard it.
-     *
-     * `handoffTool` short-circuits on all three of these, but only after being handed a
-     * `hasSomebodyToAsk` that costs a query. So a deployment which switched the capability off
-     * still paid one grants read per run of every Bot, for a tool it was never going to be offered,
-     * and a run already at the cap paid it again.
-     */
-    const couldHandOn =
-      config.handoff.maxDepth > 0 &&
-      config.handoff.maxPerRun > 0 &&
-      run.depth < config.handoff.maxDepth;
-
-    const passing = couldHandOn
-      ? handoffTool({
-          desk: handoffDesk,
-          /*
-           * How deep this run already is comes from the assertion the deployment signed when it handed
-           * this work on. A run a person started carries none, and none means zero.
-           *
-           * NOT `from.botId`. The assertion proves what this run is, and the Bot is whichever one the
-           * runtime is building right now: on a hop those agree, and taking the id from the signed
-           * value rather than from the build would let a stale assertion aim the next hop at the
-           * wrong Bot's grants.
-           */
-          from: run,
-          // Read now rather than at boot, so a grant made a minute ago counts and one revoked a
-          // minute ago stops counting.
-          hasSomebodyToAsk:
-            (
-              await pluginStore
-                .botsReachableFrom(botId)
-                .catch(() => [] as string[])
-            ).length > 0,
-          maxDepth: config.handoff.maxDepth,
-          maxPerRun: config.handoff.maxPerRun,
-        })
-      : null;
-    /*
-     * The way to stop and ask is offered whether or not there is a Bot to hand to.
-     *
-     * It is the cheaper of the two and the one a Bot should reach for first: asking the person who
-     * is already in the conversation spends nothing and cannot be aimed anywhere they cannot see.
-     * A deployment that offered only the expensive exit would push every unanswerable question
-     * sideways into another run.
-     */
-    const asking = escalationTool({
-      from: run,
-      route: askTheirOwnPerson,
-      auditStore: bootAuditStore,
-    });
-    return passing ? [passing, asking] : [asking];
-  },
+  handoffForActor,
   // A run started or ended on a thread; light the channel it belongs to. Fire-and-forget, keyed by
   // thread, and a scratch thread maps to no channel and signals nowhere.
   (input) => {
@@ -950,6 +933,71 @@ const copilotRuntime = mountCopilotRuntime(
   // they uploaded. See markAttachmentsSentForActor.
   markAttachmentsSentForActor,
 );
+
+const actorAgentResolver = createActorAgentResolver({
+  loadAgents: loadAgentsForActor,
+  model: runtimeModel,
+  resolveModelApiKey: resolveRuntimeModelApiKey,
+  stallGuard,
+  loadToolsForActor,
+  signRunForActor,
+  computerGuidance: config.computer ? COMPUTER_GUIDANCE : undefined,
+  loadVendors,
+  selectionForActor,
+  agentFetch,
+  handoffForActor,
+});
+
+const externalRouting = createCoworkerRoutingService({
+  store: agentProfileStore,
+  router: intentRouter,
+  auditStore: bootAuditStore,
+  reachableSystems: async (agentId) => {
+    const granted = await pluginStore.listForAgent(agentId);
+    return [
+      ...new Set(
+        granted.tools.map(
+          (tool) =>
+            tool.toolName.replace(/^mcp__/, "").split("__")[0] ?? tool.toolName,
+        ),
+      ),
+    ];
+  },
+});
+
+const feishuChannels = config.feishuApps.map((feishuApp) =>
+  createOpenBotFeishuChannel({
+    transport: createFeishuTransport(feishuApp),
+    agentDeps: {
+      routing: externalRouting,
+      store: externalThreadStore,
+      resolver: actorAgentResolver,
+    },
+    resolveUser: createFeishuIdentityResolver({
+      store: externalLinkStore,
+      encryptionKey: config.keyEncryptionKey,
+      appUrl: config.appUrl,
+    }),
+  }),
+);
+
+await Promise.all(feishuChannels.map((channel) => channel.start()));
+
+const requireExternalUser = config.singleUser
+  ? createDevRequireUser()
+  : (() => {
+      if (!auth) throw new Error("Feishu account linking requires authentication.");
+      return createRequireUser(auth, roleRepository);
+    })();
+
+const externalLinkRoutes = createExternalLinkRoutes({
+  store: externalLinkStore,
+  encryptionKey: config.keyEncryptionKey,
+  requireUser: requireExternalUser,
+  auditStore: bootAuditStore,
+  agentProfileStore,
+  threadStore: externalThreadStore,
+});
 
 /**
  * Delivering hops, on every replica.
@@ -1230,6 +1278,7 @@ const app = createApp(
   routineStore,
   // Where each person is in first-run onboarding, read by /api/me and written by the wizard.
   createOnboardingStore(database),
+  externalLinkRoutes,
   // The same store every run reads through `loadInstructionsForActor`, so the screen a person edits
   // and the prompt their coworker is built from can never be two different pieces of text.
   userInstructionsStore,

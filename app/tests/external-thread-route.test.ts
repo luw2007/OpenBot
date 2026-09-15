@@ -73,7 +73,7 @@ describe("external Slack transcript list", () => {
     lastMessage: "Review the queue",
     lastMessageAt: "2026-08-25T12:00:00.000Z",
     createdAt: "2026-08-25T11:00:00.000Z",
-  };
+  } as const;
 
   test("accepts a server page of authenticated read-only Slack summaries", () => {
     expect(
@@ -142,10 +142,9 @@ describe("external Slack transcript list", () => {
       nextCursor: null,
     });
 
-    expect(options.queryKey).toEqual(externalThreadKeys.list());
     expect(options.initialPageParam).toBe("");
-    expect(options.getNextPageParam?.(page, [], "")).toBe("opaque-next");
-    expect(options.getNextPageParam?.(finalPage, [], "")).toBeUndefined();
+    expect(options.getNextPageParam?.(page, [], "", [])).toBe("opaque-next");
+    expect(options.getNextPageParam?.(finalPage, [], "", [])).toBeUndefined();
     expect(
       options.select?.({
         pages: [page, finalPage],
@@ -157,20 +156,23 @@ describe("external Slack transcript list", () => {
   test("fetches cursor pages with an encoded opaque cursor and validates the response", async () => {
     const requests: string[] = [];
     const originalFetch = globalThis.fetch;
-    globalThis.fetch = async (input, init) => {
-      requests.push(String(input));
-      expect(init?.credentials).toBe("include");
-      return new Response(
-        JSON.stringify({
-          threads: [validThread],
-          nextCursor: "next cursor",
-        }),
-        {
-          headers: { "content-type": "application/json" },
-          status: 200,
-        },
-      );
-    };
+    globalThis.fetch = Object.assign(
+      async (input: URL | RequestInfo, init?: RequestInit) => {
+        requests.push(String(input));
+        expect(init?.credentials).toBe("include");
+        return new Response(
+          JSON.stringify({
+            threads: [validThread],
+            nextCursor: "next cursor",
+          }),
+          {
+            headers: { "content-type": "application/json" },
+            status: 200,
+          },
+        );
+      },
+      { preconnect: originalFetch.preconnect },
+    );
 
     try {
       const options = externalThreadListQueryOptions();

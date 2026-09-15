@@ -266,6 +266,8 @@ export function createApp(
    * nothing can finish.
    */
   onboardingStore?: OnboardingStore,
+  /** Authenticated confirmation and read-only projection routes for external identities. */
+  externalLinkRoutes?: HonoApp<{ Variables: AppVariables }>,
   /**
    * One person's standing instructions, which every built-in coworker they run is told.
    *
@@ -1206,6 +1208,10 @@ export function createApp(
 
   if (routineStore) {
     app.route("/api/routines", createRoutineRoutes(routineStore, requireUser));
+  }
+
+  if (externalLinkRoutes) {
+    app.route("/api/external-links", externalLinkRoutes);
   }
 
   if (componentStore) {

@@ -393,6 +393,7 @@ export const auditEventTypes = [
    * withholds; the offered credential never does.
    */
   "routines.dispatch_refused",
+  "external_identity.linked",
 ] as const;
 
 export type AuditEventType = (typeof auditEventTypes)[number];
@@ -436,6 +437,14 @@ export type AuditEventInput = {
 
 export type AuditStore = {
   insert: (event: AuditEventInput) => Promise<void>;
+};
+
+export type AuditTransaction = Parameters<
+  Parameters<Database["transaction"]>[0]
+>[0];
+
+export type TransactionalAuditStore = AuditStore & {
+  inTransaction: (transaction: AuditTransaction) => AuditStore;
 };
 
 export type AuditEvent = {
@@ -530,15 +539,19 @@ function initiatorColumns(initiator: AuditInitiator | undefined) {
   return { initiatorKind: initiator.kind, initiatorId: initiator.id };
 }
 
-export function createAuditStore(database: Database): AuditStore {
-  return {
+export function createAuditStore(database: Database): TransactionalAuditStore {
+  const storeFor = (client: Pick<Database, "insert">): AuditStore => ({
     insert: async ({ initiator, ...event }) => {
-      await database.insert(auditEvents).values({
+      await client.insert(auditEvents).values({
         ...event,
         ...initiatorColumns(initiator),
         payload: redactAuditPayload(event.payload) as Record<string, unknown>,
       });
     },
+  });
+  return {
+    ...storeFor(database),
+    inTransaction: storeFor,
   };
 }
 

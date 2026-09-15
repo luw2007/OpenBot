@@ -22,6 +22,7 @@ function channel(
     agentIds: [`agent-${id}`],
     threadId: `thread-${id}`,
     active: true,
+    summary: null,
     lastMessage: null,
     lastMessageAt: null,
     lastMessageAgentId: null,
