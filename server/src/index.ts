@@ -941,7 +941,7 @@ const copilotRuntime = mountCopilotRuntime(
       auditStore: bootAuditStore,
     });
     return passing ? [passing, asking] : [asking];
-  };
+  },
 
 /**
  * One place a coworker is built for one person, for every surface that runs one.
@@ -1542,7 +1542,7 @@ const isProxiedStream = (data: SocketData): data is StreamData =>
 const asChannelSocket = (ws: { data: SocketData }) =>
   ws as unknown as ChannelSocket;
 
-serve<SocketData>({
+const serverOptions = {
   port,
   async fetch(request, server) {
     const url = new URL(request.url);
