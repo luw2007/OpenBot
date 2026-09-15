@@ -84,12 +84,6 @@ import {
 import { createDatabase } from "./db/client";
 import { intelligenceChannelMappings } from "./db/schema";
 import { createOnboardingStore } from "./people/onboarding";
-import { createExternalLinkStore } from "./external/link-store";
-import { createExternalLinkRoutes } from "./external/routes";
-import { createExternalThreadStore } from "./external/thread-store";
-import { createOpenBotFeishuChannel } from "./feishu/channel";
-import { createFeishuIdentityResolver } from "./feishu/identity";
-import { createFeishuTransport } from "./feishu/transport";
 import { createPeopleStore } from "./people/store";
 import { useRoutineTools } from "./plugins/builtin-routines";
 import { redirectUriFor } from "./plugins/oauth";
@@ -947,221 +941,6 @@ const copilotRuntime = mountCopilotRuntime(
   (input) => {
     void channelStore.signalBusy(input.threadId, input.busy).catch(() => {});
   },
-  loadInstructionsForActor,
-  loadAttachmentForActor,
-  markAttachmentsSentForActor,
-);
-
-/**
- * One place a coworker is built for one person, for every surface that runs one.
- *
- * The named constants above exist because two callers had to build the SAME Bot. There are now
- * four — a person's chat request, a routine's headless turn, a hop delivered to another Bot, and a
- * Slack thread — and passing eleven collaborators to each of them in the right order is a drift
- * waiting to happen: a surface that got one argument wrong would run, and quietly hold different
- * tools or a different role from the Bot the person is talking to. So the collaborators are bound
- * once here, and every surface asks this for a coworker instead.
- */
-const actorAgentResolver = createActorAgentResolver({
-  loadAgents: loadAgentsForActor,
-  model: tenantPackage.model,
-  resolveModelApiKey: resolveRuntimeModelApiKey,
-  stallGuard,
-  loadToolsForActor,
-  signRunForActor,
-  /*
-   * Only when a computer exists. The tools themselves are registered by the surface, so a Bot is
-   * offered them without this and the guidance is what tells it how they go together: snapshot
-   * before acting, and ask a person to take the wheel at a sign-in rather than reporting the task
-   * as impossible. Absent computer, absent guidance: a Bot is not told about hands it has not got.
-   */
-  computerGuidance: config.computer ? COMPUTER_GUIDANCE : undefined,
-  loadVendors,
-  selectionForActor,
-  agentFetch,
-  handoffForActor,
-});
-
-/**
- * Who a routine acts as, resolved the way {@link resolveRequestActor} resolves it.
- *
- * THE ROLE IS READ, NOT ASSUMED. Which coworkers exist is decided per person and an administrator
- * sees Bots a user does not, so hardcoding `role: "user"` here would hide an administrator's own Bots
- * from their own routine — the routine would fail with "that Bot is no longer registered" for a Bot
- * sitting in front of them in chat. This asks the same repository the request path asks, so a routine
- * sees exactly the coworkers its owner sees.
- */
-const actorFor = async (ownerUserId: string): Promise<AgentActor> => {
-  // One person, and they are an administrator. The id stays the routine owner's rather than being
-  // rewritten to DEV_ACTOR's: in this mode they are the same person, and if they ever were not,
-  // silently borrowing the dev actor's identity would be worse than finding nothing.
-  if (config.singleUser) return { id: ownerUserId, role: DEV_ACTOR.role };
-  const roles = await roleRepository.rolesForUser(ownerUserId);
-  if (!roles.includes("admin") && !roles.includes("user")) {
-    throw new Error("A routine requires an authorized owner.");
-  }
-  return {
-    id: ownerUserId,
-    role: roles.includes("admin") ? "admin" : "user",
-  };
-};
-
-/**
- * One Bot, built for a routine's turn, as its owner.
- *
- * Per turn rather than per boot, for the same reason the request path rebuilds: a Bot registered or
- * edited since the last firing has to count, and a private coworker must be absent for everybody but
- * its owner. No header and no request are involved — the owner is asserted by construction, from the
- * routine row — which is the whole point of doing it here rather than adding an impersonation path to
- * a public route.
- */
-const buildAgentFor = async ({
-  ownerUserId,
-  agentId,
-}: {
-  ownerUserId: string;
-  agentId: string;
-}) => {
-  const actor = await actorFor(ownerUserId);
-  // Only the Bot this routine names. Same reason as the hop delivery: the roster is still read in
-  // full so a Bot this owner cannot see is still absent, but the other Bots are neither built nor
-  // asked what they hold.
-  const agent = await actorAgentResolver
-    .resolveAgentForActor(actor, agentId)
-    .catch(() => null);
-  if (!agent) {
-    /*
-     * Named, and raised rather than swallowed. The routine's Bot was deleted, or made private by
-     * somebody else, or the owner lost the role that could see it. The runner turns this into a
-     * failed run row with this sentence on it, the first failure is said once in the channel, and
-     * the fatigue rule switches the routine off after ten — which is exactly the right handling for
-     * a routine pointed at something that is not coming back.
-     */
-    const error = new Error(
-      `That Bot is no longer registered, so this routine has nothing to run: ${agentId}.`,
-    );
-    error.name = "RoutineBotNotRegistered";
-    throw error;
-  }
-  return agent;
-};
-
-const routineRunner =
-  config.runtime.mode === "intelligence"
-    ? (() => {
-        const intelligence = new CopilotKitIntelligence({
-          apiUrl: config.runtime.intelligence.apiUrl,
-          wsUrl: config.runtime.intelligence.gatewayWsUrl,
-          apiKey: config.runtime.intelligence.apiKey,
-        });
-        const runner = new IntelligenceAgentRunner({
-          url: intelligence.ɵgetRunnerWsUrl(),
-          authToken: intelligence.ɵgetRunnerAuthToken(),
-        });
-        return createRoutineRunner({
-          routineStore,
-          channelStore,
-          runTurn: createTurnRunner({
-            intelligence,
-            runner,
-            buildAgentFor,
-          }),
-        });
-      })()
-    : undefined;
-
-/**
- * The Slack surface, and the runtime both surfaces share.
- *
- * One Channel declaration, handed to the same `CopilotRuntime` the browser talks to, so a Slack
- * turn and a web turn resolve the same coworker for the same person through the same resolver,
- * policy and audit store. Nothing about Slack reaches further in than this: the channel is handed
- * a routing service, a thread store and the resolver, and builds no Bot of its own.
- */
-const slackRouting = createCoworkerRoutingService({
-  store: agentProfileStore,
-  router: intentRouter,
-  auditStore: bootAuditStore,
-  /*
-   * Which systems a coworker can reach, for the router to weigh alongside what it is for.
-   *
-   * Read from the grants rather than held, because a grant made a minute ago has to count. A read
-   * that fails stops the routing rather than routing on a false statement about what a coworker can
-   * reach: see `CoworkerReachabilityUnavailableError`.
-   */
-  reachableSystems: async (agentId) => {
-    const granted = await pluginStore.listForAgent(agentId);
-    return [
-      ...new Set(
-        granted.tools.map(
-          (tool) =>
-            tool.toolName.replace(/^mcp__/, "").split("__")[0] ?? tool.toolName,
-        ),
-      ),
-    ];
-  },
-});
-const slackIngress = new SlackIngressRegistry();
-const openbotSlackChannel = createOpenBotSlackChannel({
-  appUrl: config.appUrl,
-  configuredTenantId: config.slackTenantId,
-  identityLinker: new SlackIdentityLinker({
-    store: externalLinkStore,
-    encryptionKey: config.keyEncryptionKey,
-    appUrl: config.appUrl,
-  }),
-  ingressRegistry: slackIngress,
-  agentDeps: {
-    routing: slackRouting,
-    store: externalThreadStore,
-    resolver: actorAgentResolver,
-  },
-  computerGateway,
-  // Secrets, sign-in control and 2FA are asked for on OpenBot's own surface, never in Slack. Absent
-  // an app URL there is nowhere to send somebody, so the channel offers no assistance at all.
-  assistance: config.appUrl
-    ? { appUrl: config.appUrl, encryptionKey: config.keyEncryptionKey }
-    : undefined,
-});
-
-/**
- * The runtime, and the two things beside it a hop needs.
- *
- * `agentFor` builds the addressed Bot exactly the way a person's run builds it, and `history` reads
- * the conversation through the same client. Taken from here rather than assembled again, because a
- * Bot built by parallel wiring drifts the first time one of these arguments changes, and the drift is
- * invisible: it runs, and quietly holds different tools or a different role from the one the person
- * is talking to.
- */
-const feishuChannels = config.feishuApps.map((feishuApp) =>
-  createOpenBotFeishuChannel({
-    transport: createFeishuTransport(feishuApp),
-    agentDeps: {
-      routing: slackRouting,
-      store: externalThreadStore,
-      resolver: actorAgentResolver,
-    },
-    resolveUser: createFeishuIdentityResolver({
-      store: externalLinkStore,
-      encryptionKey: config.keyEncryptionKey,
-      appUrl: config.appUrl,
-    }),
-  }),
-);
-
-const copilotRuntime = mountCopilotRuntime(
-  config,
-  actorAgentResolver,
-  identifyUser,
-  identifyActor,
-  "/api/copilotkit",
-  loadVendors,
-  selectionForActor,
-  agentFetch,
-  handoffForActor,
-  (input) => {
-    void channelStore.signalBusy(input.threadId, input.busy).catch(() => {});
-  },
   // What this person has told every coworker of theirs, in every channel. See user-instructions.ts.
   loadInstructionsForActor,
   // The files on a message, put in front of the model rather than left as links it cannot follow —
@@ -1172,30 +951,6 @@ const copilotRuntime = mountCopilotRuntime(
   markAttachmentsSentForActor,
 );
 
-await Promise.all(feishuChannels.map((channel) => channel.start()));
-
-/*
- * The guard the account-link confirmation runs behind: a person's own session, never Slack's word.
- *
- * `loadConfig` permits no-provider operation only in explicit single-user mode. The invariant is
- * checked again here so this route can never be handed an undefined auth service.
- */
-const requireExternalUser = config.singleUser
-  ? createDevRequireUser()
-  : (() => {
-      if (!auth) {
-        throw new Error("Slack account linking requires authentication.");
-      }
-      return createRequireUser(auth, roleRepository);
-    })();
-const externalLinkRoutes = createExternalLinkRoutes({
-  store: externalLinkStore,
-  encryptionKey: config.keyEncryptionKey,
-  requireUser: requireExternalUser,
-  auditStore: bootAuditStore,
-  agentProfileStore,
-  threadStore: externalThreadStore,
-});
 /**
  * Delivering hops, on every replica.
  *
@@ -1505,8 +1260,6 @@ const app = createApp(
   },
 );
 
-app.route("/api/external", externalLinkRoutes);
-
 /**
  * The live screen, proxied.
  *
@@ -1553,7 +1306,7 @@ const isProxiedStream = (data: SocketData): data is StreamData =>
 const asChannelSocket = (ws: { data: SocketData }) =>
   ws as unknown as ChannelSocket;
 
-const serverOptions = {
+serve<SocketData>({
   port,
   async fetch(request, server) {
     const url = new URL(request.url);
@@ -1651,35 +1404,6 @@ const serverOptions = {
       ws.data.inward?.close();
     },
   },
-} satisfies Bun.Serve.Options<SocketData>;
-const startWeb = () => serve<SocketData>(serverOptions);
-
-/**
- * The listener, started and stopped by the managed Slack host rather than at import.
- *
- * Managed Slack delivery arrives over an outbound socket this process opens, so the channel host
- * has to be running before a Slack turn can reach a coworker, and the HTTP listener has to be up
- * before the host so that setup and health stay reachable while attachment settles. Ownership of
- * both is handed to one place so a signal stops them in that order, rather than a signal handler
- * here racing an attachment that is still in progress.
- */
-const managedHost = startManagedChannelHost({
-  startWeb,
-  stopWeb: (server) => server.stop(true),
-  channels: copilotRuntime.channels,
-  signals: process,
-  // Each listener holds a connection of its own for the life of the process. Released on the way
-  // out, so a watch-mode restart does not leave two behind on every reload.
-  stopOthers: [
-    () =>
-      Promise.all(feishuChannels.map((channel) => channel.stop())).then(
-        () => undefined,
-      ),
-    () => channelActivityListener.stop(),
-    () => policyListener.stop(),
-    () => retentionSweeps.stop(),
-  ],
-  exit: (code) => process.exit(code),
 });
 
 if (config.singleUser) {
